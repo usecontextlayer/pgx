@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo dist:*)",
+      "Bash(rustc:*)",
+      "Bash(cargo --version:*)",
+      "mcp__context7__resolve-library-id",
+      "mcp__context7__query-docs",
+      "Bash(cargo install:*)",
+      "Bash(dist init:*)",
+      "Bash(~/.cargo/bin/dist init:*)",
+      "Bash(~/.cargo/bin/dist generate:*)"
+    ]
+  }
+}
