@@ -9,7 +9,14 @@
       "Bash(cargo install:*)",
       "Bash(dist init:*)",
       "Bash(~/.cargo/bin/dist init:*)",
-      "Bash(~/.cargo/bin/dist generate:*)"
+      "Bash(~/.cargo/bin/dist generate:*)",
+      "Bash(gh run list:*)",
+      "Bash(gh api:*)",
+      "Bash(git -C /Users/alizain/ContextLayer/pgx tag -d v0.1.0)",
+      "Bash(git -C /Users/alizain/ContextLayer/pgx push origin :refs/tags/v0.1.0)",
+      "Bash(git -C /Users/alizain/ContextLayer/pgx tag v0.1.0)",
+      "Bash(git -C /Users/alizain/ContextLayer/pgx push origin v0.1.0)",
+      "Bash(gh run view:*)"
     ]
   }
 }
