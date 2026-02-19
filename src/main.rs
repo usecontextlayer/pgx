@@ -16,6 +16,9 @@ use std::os::unix::fs::PermissionsExt;
 type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 const PG_VERSION_REQ: &str = "=18";
+const PGX_DATA_DIR_ENV: &str = "PGX_DATA_DIR";
+const CONNECTION_DETAILS_UNAVAILABLE_ERROR: &str =
+    "connection details unavailable (missing state or password metadata)";
 
 #[derive(Debug, Parser)]
 #[command(name = "pgx")]
@@ -30,12 +33,13 @@ enum Commands {
     Start(StartArgs),
     Stop(DataDirArgs),
     Status(DataDirArgs),
+    Url(DataDirArgs),
 }
 
 #[derive(Debug, Args)]
 struct StartArgs {
     #[arg(long)]
-    data_dir: PathBuf,
+    data_dir: Option<PathBuf>,
     #[arg(long, default_value_t = 0)]
     port: u16,
     #[arg(long, default_value = "localhost")]
@@ -47,13 +51,24 @@ struct StartArgs {
 #[derive(Debug, Args)]
 struct DataDirArgs {
     #[arg(long)]
-    data_dir: PathBuf,
+    data_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct StateFile {
     port: u16,
     host: String,
+}
+
+struct RuntimeConnectionDetails {
+    host: String,
+    port: u16,
+    password: String,
+}
+
+struct RuntimeContext {
+    connection: RuntimeConnectionDetails,
+    postgresql: PostgreSQL,
 }
 
 enum ShutdownOutcome {
@@ -72,6 +87,7 @@ async fn main() {
         Commands::Start(args) => handle_start(args).await,
         Commands::Stop(args) => handle_stop(args).await,
         Commands::Status(args) => handle_status(args).await,
+        Commands::Url(args) => handle_url(args).await,
     };
 
     if let Err(error) = result {
@@ -81,34 +97,33 @@ async fn main() {
 }
 
 async fn handle_start(args: StartArgs) -> AppResult<()> {
-    fs::create_dir_all(&args.data_dir)?;
+    let data_dir = resolve_data_dir(args.data_dir)?;
+    fs::create_dir_all(&data_dir)?;
 
-    let password = resolve_start_password(&args.data_dir)?;
+    let password = resolve_start_password(&data_dir)?;
     let mut postgresql = PostgreSQL::new(build_settings(
-        &args.data_dir,
+        &data_dir,
         Some(args.host),
         Some(args.port),
         password,
     )?);
 
     if postgresql.status() == Status::Started {
-        return Err(io::Error::other(format!(
-            "server already running for {}",
-            args.data_dir.display()
-        ))
-        .into());
+        return Err(
+            io::Error::other(format!("server already running for {}", data_dir.display())).into(),
+        );
     }
 
     postgresql.setup().await?;
     postgresql.start().await?;
 
     let running = postgresql.settings();
-    let password = managed_password_for_connection(&args.data_dir, running)?;
+    let password = managed_password_for_connection(&data_dir, running)?;
     let state = StateFile {
         host: running.host.clone(),
         port: running.port,
     };
-    write_state_file(&args.data_dir, &state)?;
+    write_state_file(&data_dir, &state)?;
     println!("{}", connection_url(&running.host, running.port, &password));
 
     if args.daemon {
@@ -131,50 +146,115 @@ async fn handle_start(args: StartArgs) -> AppResult<()> {
 }
 
 async fn handle_stop(args: DataDirArgs) -> AppResult<()> {
-    let state = read_state_file(&args.data_dir)?;
-    let password = read_managed_password_file(&args.data_dir)?;
-    let settings = build_settings(
-        &args.data_dir,
-        state.as_ref().map(|s| s.host.clone()),
-        state.as_ref().map(|s| s.port),
-        password,
-    )?;
-    let mut postgresql = PostgreSQL::new(settings);
+    let mut runtime = load_runtime_context(args.data_dir)?;
 
-    if postgresql.status() != Status::Started {
+    if runtime.postgresql.status() != Status::Started {
         println!("not running");
         return Ok(());
     }
 
-    postgresql.setup().await?;
-    postgresql.stop().await?;
+    runtime.postgresql.setup().await?;
+    runtime.postgresql.stop().await?;
     println!("stopped");
     Ok(())
 }
 
 async fn handle_status(args: DataDirArgs) -> AppResult<()> {
-    let state = read_state_file(&args.data_dir)?;
-    let password = read_managed_password_file(&args.data_dir)?;
-    let settings = build_settings(
-        &args.data_dir,
-        state.as_ref().map(|s| s.host.clone()),
-        state.as_ref().map(|s| s.port),
-        password.clone(),
-    )?;
-    let postgresql = PostgreSQL::new(settings);
+    let runtime = load_runtime_context(args.data_dir)?;
 
-    if postgresql.status() == Status::Started {
+    if runtime.postgresql.status() == Status::Started {
         println!("running");
-        if let (Some(state), Some(password)) = (state, password) {
-            println!("{}", connection_url(&state.host, state.port, &password));
-        } else {
-            println!("connection details unavailable (missing state or password metadata)");
-        }
+        println!(
+            "{}",
+            connection_url(
+                &runtime.connection.host,
+                runtime.connection.port,
+                &runtime.connection.password
+            )
+        );
         return Ok(());
     }
 
     println!("not running");
     Ok(())
+}
+
+async fn handle_url(args: DataDirArgs) -> AppResult<()> {
+    let runtime = load_runtime_context(args.data_dir)?;
+
+    if runtime.postgresql.status() != Status::Started {
+        return Err(io::Error::other("not running").into());
+    }
+
+    println!(
+        "{}",
+        connection_url(
+            &runtime.connection.host,
+            runtime.connection.port,
+            &runtime.connection.password
+        )
+    );
+    Ok(())
+}
+
+fn resolve_data_dir(cli_data_dir: Option<PathBuf>) -> AppResult<PathBuf> {
+    if let Some(env_data_dir_raw) = std::env::var_os(PGX_DATA_DIR_ENV) {
+        if env_data_dir_raw.is_empty() {
+            return Err(io::Error::other(format!("{PGX_DATA_DIR_ENV} is set but empty")).into());
+        }
+
+        let env_data_dir = PathBuf::from(env_data_dir_raw);
+        if let Some(cli_data_dir) = cli_data_dir
+            && cli_data_dir != env_data_dir
+        {
+            eprintln!("warning: --data-dir is ignored because PGX_DATA_DIR is set");
+        }
+
+        return Ok(env_data_dir);
+    }
+
+    if let Some(cli_data_dir) = cli_data_dir {
+        return Ok(cli_data_dir);
+    }
+
+    Err(io::Error::other(format!(
+        "missing data directory: set {PGX_DATA_DIR_ENV} or pass --data-dir"
+    ))
+    .into())
+}
+
+fn metadata_error() -> io::Error {
+    io::Error::other(CONNECTION_DETAILS_UNAVAILABLE_ERROR)
+}
+
+fn load_runtime_connection_details(data_dir: &Path) -> AppResult<RuntimeConnectionDetails> {
+    let state = read_state_file(data_dir).map_err(|_| metadata_error())?;
+    let password = read_managed_password_file(data_dir).map_err(|_| metadata_error())?;
+
+    let state = state.ok_or_else(metadata_error)?;
+    let password = password.ok_or_else(metadata_error)?;
+
+    Ok(RuntimeConnectionDetails {
+        host: state.host,
+        port: state.port,
+        password,
+    })
+}
+
+fn load_runtime_context(cli_data_dir: Option<PathBuf>) -> AppResult<RuntimeContext> {
+    let data_dir = resolve_data_dir(cli_data_dir)?;
+    let connection = load_runtime_connection_details(&data_dir)?;
+    let settings = build_settings(
+        &data_dir,
+        Some(connection.host.clone()),
+        Some(connection.port),
+        Some(connection.password.clone()),
+    )?;
+
+    Ok(RuntimeContext {
+        connection,
+        postgresql: PostgreSQL::new(settings),
+    })
 }
 
 #[cfg(unix)]
