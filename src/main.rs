@@ -1,3 +1,5 @@
+mod extensions;
+
 use clap::{Args, Parser, Subcommand};
 use postgresql_embedded::{PostgreSQL, Settings, Status, VersionReq};
 use serde::{Deserialize, Serialize};
@@ -15,14 +17,14 @@ use std::os::unix::fs::PermissionsExt;
 
 type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
-const PG_VERSION_REQ: &str = "=18";
+const PG_VERSION_REQ: &str = "=17";
 const PGX_DATA_DIR_ENV: &str = "PGX_DATA_DIR";
 const CONNECTION_DETAILS_UNAVAILABLE_ERROR: &str =
     "connection details unavailable (missing state or password metadata)";
 
 #[derive(Debug, Parser)]
 #[command(name = "pgx")]
-#[command(about = "Run embedded PostgreSQL 18 locally.")]
+#[command(about = "Run embedded PostgreSQL 17 locally.")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -115,7 +117,15 @@ async fn handle_start(args: StartArgs) -> AppResult<()> {
     }
 
     postgresql.setup().await?;
+
+    extensions::initialize()?;
+    extensions::install_pg_search(postgresql.settings()).await?;
+    tracing::info!("pg_search extension installed");
+
     postgresql.start().await?;
+
+    extensions::enable_pg_search(postgresql.settings()).await?;
+    tracing::info!("pg_search extension enabled");
 
     let running = postgresql.settings();
     let password = managed_password_for_connection(&data_dir, running)?;
